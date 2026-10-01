@@ -1,25 +1,17 @@
-
 const express = require("express");
 
 const {
-  getCustomerTransactions,
+  transfer,
   getTransactionStatus,
+  getTransactions,
 } = require("../controllers/transactionController");
-
-const authenticate = require("../Middleware/authMiddleware");
 
 const router = express.Router();
 
-router.get(
-  "/:customer_id/transactions",
-  authenticate,
-  getCustomerTransactions
-);
+router.post("/transfer", transfer);
 
-router.get(
-  "/status/:reference",
-  authenticate,
-  getTransactionStatus
-);
+router.get("/status/:reference", getTransactionStatus);
+
+router.get("/:customerId/transactions", getTransactions);
 
 module.exports = router;

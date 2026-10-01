@@ -1,3 +1,4 @@
+
 const axios = require("axios");
 
 const NIBSS_BASE_URL = process.env.NIBSS_BASE_URL;
@@ -14,15 +15,28 @@ const getNIBSSToken = async () => {
   return response.data.token;
 };
 
-const transferFunds = async (from, to, amount) => {
+const transferFunds = async (
+  from,
+  to,
+  bankCode,
+  amount
+) => {
   const token = await getNIBSSToken();
+
+  console.log("NIBSS transfer values:", {
+    from,
+    to,
+    bankCode,
+    amount,
+    amountType: typeof amount,
+  });
 
   const response = await axios.post(
     `${NIBSS_BASE_URL}/api/transfer`,
     {
       from,
       to,
-      amount,
+      amount: Number(amount),
     },
     {
       headers: {
@@ -35,4 +49,7 @@ const transferFunds = async (from, to, amount) => {
   return response.data;
 };
 
-module.exports = { transferFunds };
+module.exports = {
+  transferFunds,
+};
+

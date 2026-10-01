@@ -1,21 +1,13 @@
-
 const axios = require("axios");
 const pool = require("../config/database");
 
+// CREATE ACCOUNT
 const createAccount = async (req, res) => {
-  const { customer_id } = req.body;
+  const customerId = req.user.customer_id;
 
-  if (!customer_id) {
-    return res.status(400).json({
-      message: "Customer ID is required",
-    });
-  }
-
-  const customerId = Number(customer_id);
-
-  if (!Number.isInteger(customerId) || customerId <= 0) {
-    return res.status(400).json({
-      message: "Invalid customer ID",
+  if (!customerId) {
+    return res.status(401).json({
+      message: "Authenticated customer not found",
     });
   }
 
@@ -37,12 +29,11 @@ const createAccount = async (req, res) => {
       `SELECT
          verification_type,
          verification_number,
-         verification_dob
+         verification_dob,
+         provider_reference
        FROM onboarding
        WHERE customer_id = $1
          AND status = 'VERIFIED'
-         AND verification_number IS NOT NULL
-         AND verification_dob IS NOT NULL
        ORDER BY created_at DESC
        LIMIT 1`,
       [customerId]
@@ -75,7 +66,63 @@ const createAccount = async (req, res) => {
       });
     }
 
-    const kycType = onboarding.verification_type.toLowerCase();
+    /*
+     * PAYASAP PORTFOLIO DEMO ACCOUNT
+     *
+     * Demo identities use PAYASAP-DEMO as their provider
+     * reference. For these customers, we create the
+     * account locally instead of sending the fake identity
+     * to NIBSS.
+     */
+    if (onboarding.provider_reference === "PAYASAP-DEMO") {
+      let accountNumber;
+      let accountExists = true;
+
+      while (accountExists) {
+        accountNumber = Math.floor(
+          1000000000 + Math.random() * 9000000000
+        ).toString();
+
+        const duplicateCheck = await pool.query(
+          `SELECT id
+           FROM accounts
+           WHERE account_number = $1`,
+          [accountNumber]
+        );
+
+        accountExists = duplicateCheck.rows.length > 0;
+      }
+
+      const result = await pool.query(
+        `INSERT INTO accounts (
+           customer_id,
+           account_number,
+           nibss_account_number,
+           balance
+         )
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [
+          customerId,
+          accountNumber,
+          accountNumber,
+          15000,
+        ]
+      );
+
+      return res.status(201).json({
+        message: "Demo account created successfully",
+        account: result.rows[0],
+        demo: true,
+      });
+    }
+
+    /*
+     * REAL/TEST NIBSS ACCOUNT CREATION
+     */
+    const kycType =
+      onboarding.verification_type.toLowerCase();
+
     const kycId = onboarding.verification_number;
 
     const dob = new Date(onboarding.verification_dob)
@@ -146,11 +193,60 @@ const createAccount = async (req, res) => {
 
     return res.status(error.response?.status || 500).json({
       message: "Failed to create account",
-      error: error.response?.data || error.message,
+      error:
+        error.response?.data || error.message,
     });
   }
 };
 
+
+// GET LOGGED-IN CUSTOMER'S ACCOUNT
+const getMyAccount = async (req, res) => {
+  const customerId = req.user.customer_id;
+
+  if (!customerId) {
+    return res.status(401).json({
+      message: "Authenticated customer not found",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         id,
+         nibss_account_number,
+         balance,
+         savebox_balance,
+         created_at
+       FROM accounts
+       WHERE customer_id = $1`,
+      [customerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        message: "Account not found",
+      });
+    }
+
+    return res.status(200).json({
+      message: "Account retrieved successfully",
+      account: result.rows[0],
+    });
+  } catch (error) {
+    console.error(
+      "Get account error:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Failed to retrieve account",
+    });
+  }
+};
+
+
+// GET ACCOUNT BALANCE
 const getAccountBalance = async (req, res) => {
   const { account_number } = req.params;
 
@@ -181,7 +277,10 @@ const getAccountBalance = async (req, res) => {
       account: result.rows[0],
     });
   } catch (error) {
-    console.error("Balance enquiry error:", error);
+    console.error(
+      "Balance enquiry error:",
+      error
+    );
 
     return res.status(500).json({
       message: "Failed to retrieve account balance",
@@ -189,8 +288,197 @@ const getAccountBalance = async (req, res) => {
   }
 };
 
-module.exports = {
-  createAccount,
-  getAccountBalance,
+// MOVE MONEY TO SAVEBOX
+const moveToSaveBox = async (req, res) => {
+  const customerId = req.user.customer_id;
+  const { amount } = req.body;
+
+  if (!customerId) {
+    return res.status(401).json({
+      message: "Authenticated customer not found",
+    });
+  }
+
+  const transferAmount = Number(amount);
+
+  if (!transferAmount || transferAmount <= 0) {
+    return res.status(400).json({
+      message: "A valid amount greater than 0 is required",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const accountResult = await client.query(
+      `SELECT
+         id,
+         balance,
+         savebox_balance
+       FROM accounts
+       WHERE customer_id = $1
+       FOR UPDATE`,
+      [customerId]
+    );
+
+    if (accountResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        message: "Account not found",
+      });
+    }
+
+    const account = accountResult.rows[0];
+
+    const mainBalance = Number(account.balance);
+
+    if (transferAmount > mainBalance) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        message: "Insufficient funds",
+        balance: mainBalance,
+      });
+    }
+
+    const result = await client.query(
+      `UPDATE accounts
+       SET
+         balance = balance - $1,
+         savebox_balance = savebox_balance + $1
+       WHERE id = $2
+       RETURNING
+         id,
+         account_number,
+         balance,
+         savebox_balance`,
+      [transferAmount, account.id]
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      message: "Money moved to SaveBox successfully",
+      account: result.rows[0],
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error(
+      "SaveBox transfer error:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Failed to move money to SaveBox",
+    });
+  } finally {
+    client.release();
+  }
 };
 
+
+// MOVE MONEY FROM SAVEBOX BACK TO MAIN ACCOUNT
+const withdrawFromSaveBox = async (req, res) => {
+  const customerId = req.user.customer_id;
+  const { amount } = req.body;
+
+  if (!customerId) {
+    return res.status(401).json({
+      message: "Authenticated customer not found",
+    });
+  }
+
+  const withdrawAmount = Number(amount);
+
+  if (!Number.isFinite(withdrawAmount) || withdrawAmount <= 0) {
+    return res.status(400).json({
+      message: "A valid amount greater than 0 is required",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const accountResult = await client.query(
+      `SELECT
+         id,
+         balance,
+         savebox_balance
+       FROM accounts
+       WHERE customer_id = $1
+       FOR UPDATE`,
+      [customerId]
+    );
+
+    if (accountResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        message: "Account not found",
+      });
+    }
+
+    const account = accountResult.rows[0];
+
+    const saveBoxBalance = Number(
+      account.savebox_balance || 0
+    );
+
+    if (withdrawAmount > saveBoxBalance) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        message: "Insufficient SaveBox funds",
+        savebox_balance: saveBoxBalance,
+      });
+    }
+
+    const result = await client.query(
+      `UPDATE accounts
+       SET
+         balance = balance + $1,
+         savebox_balance = savebox_balance - $1
+       WHERE id = $2
+       RETURNING
+         id,
+         account_number,
+         balance,
+         savebox_balance`,
+      [withdrawAmount, account.id]
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      message: "Money withdrawn from SaveBox successfully",
+      account: result.rows[0],
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error(
+      "SaveBox withdrawal error:",
+      error
+    );
+
+    return res.status(500).json({
+      message: "Failed to withdraw money from SaveBox",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = {
+  createAccount,
+  getMyAccount,
+  getAccountBalance,
+  moveToSaveBox,
+  withdrawFromSaveBox,
+};

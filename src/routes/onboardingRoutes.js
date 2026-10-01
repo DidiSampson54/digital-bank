@@ -4,8 +4,10 @@ const {
   verifyCustomer,
 } = require("../controllers/onboardingController");
 
+const authenticate = require("../Middleware/authMiddleware");
+
 const router = express.Router();
 
-router.post("/", verifyCustomer);
+router.post("/", authenticate, verifyCustomer);
 
 module.exports = router;

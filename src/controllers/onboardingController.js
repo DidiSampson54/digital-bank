@@ -1,39 +1,41 @@
-
 const axios = require("axios");
 const pool = require("../config/database");
 
 const verifyCustomer = async (req, res) => {
+  const { bvn, nin, dob } = req.body;
+
+  const customerId = req.user.customer_id;
+
+  if (!customerId) {
+    return res.status(401).json({
+      message: "Authenticated customer not found",
+    });
+  }
+
+  if (!bvn && !nin) {
+    return res.status(400).json({
+      message: "BVN or NIN is required",
+    });
+  }
+
+  if (bvn && nin) {
+    return res.status(400).json({
+      message: "Please provide either BVN or NIN, not both",
+    });
+  }
+
+  if (!dob) {
+    return res.status(400).json({
+      message: "Date of birth is required",
+    });
+  }
+
   try {
-    const { customer_id, bvn, nin } = req.body;
-
-    if (!customer_id) {
-      return res.status(400).json({
-        message: "Customer ID is required",
-      });
-    }
-
-    if (!bvn && !nin) {
-      return res.status(400).json({
-        message: "BVN or NIN is required",
-      });
-    }
-
-    if (bvn && nin) {
-      return res.status(400).json({
-        message: "Provide either BVN or NIN, not both",
-      });
-    }
-
-    const customerId = Number(customer_id);
-
-    if (!Number.isInteger(customerId) || customerId <= 0) {
-      return res.status(400).json({
-        message: "Invalid customer ID",
-      });
-    }
-
     const customerResult = await pool.query(
-      `SELECT id
+      `SELECT
+         id,
+         demo_nin,
+         demo_bvn
        FROM customers
        WHERE id = $1`,
       [customerId]
@@ -45,99 +47,130 @@ const verifyCustomer = async (req, res) => {
       });
     }
 
-    let response;
+    const customer = customerResult.rows[0];
+
     let verificationType;
     let verificationNumber;
-    let verificationDob;
-    let providerReference;
+    let isDemoIdentity = false;
+
+    if (nin) {
+      verificationType = "NIN";
+      verificationNumber = nin;
+
+      if (customer.demo_nin === nin) {
+        isDemoIdentity = true;
+      }
+    }
+
+    if (bvn) {
+      verificationType = "BVN";
+      verificationNumber = bvn;
+
+      if (customer.demo_bvn === bvn) {
+        isDemoIdentity = true;
+      }
+    }
+
+    if (isDemoIdentity) {
+      await pool.query(
+        `INSERT INTO onboarding (
+          customer_id,
+          verification_type,
+          verification_number,
+          verification_dob,
+          status,
+          provider_reference,
+          verified_at,
+          created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+        ON CONFLICT (customer_id)
+        DO UPDATE SET
+          verification_type = EXCLUDED.verification_type,
+          verification_number = EXCLUDED.verification_number,
+          verification_dob = EXCLUDED.verification_dob,
+          status = EXCLUDED.status,
+          provider_reference = EXCLUDED.provider_reference,
+          verified_at = NOW()`,
+        [
+          customerId,
+          verificationType,
+          verificationNumber,
+          dob,
+          "VERIFIED",
+          "PAYASAP-DEMO",
+        ]
+      );
+
+      return res.status(200).json({
+        message: "Demo customer verification successful",
+        verification_type: verificationType,
+        verification_number: verificationNumber,
+        date_of_birth: dob,
+        status: "VERIFIED",
+        demo: true,
+      });
+    }
+
+    let response;
+
+    if (nin) {
+      response = await axios.post(
+        `${process.env.NIBSS_BASE_URL}/api/validateNin`,
+        { nin }
+      );
+    }
 
     if (bvn) {
       response = await axios.post(
         `${process.env.NIBSS_BASE_URL}/api/validateBvn`,
         { bvn }
       );
-
-      verificationType = "BVN";
-      verificationNumber = bvn;
-      verificationDob = response.data.data?.dob;
-      providerReference = null;
-    } else {
-      response = await axios.post(
-        `${process.env.NIBSS_BASE_URL}/api/validateNin`,
-        { nin }
-      );
-
-      verificationType = "NIN";
-      verificationNumber = nin;
-      verificationDob = response.data.response?.dob;
-      providerReference = response.data.response?._id || null;
     }
 
-    if (!verificationDob) {
-      return res.status(400).json({
-        message: "Verification succeeded but date of birth was not provided",
-      });
-    }
+    const providerData = response.data;
 
-    const existingOnboarding = await pool.query(
-      `SELECT id
-       FROM onboarding
-       WHERE customer_id = $1`,
-      [customerId]
+    await pool.query(
+      `INSERT INTO onboarding (
+        customer_id,
+        verification_type,
+        verification_number,
+        verification_dob,
+        status,
+        provider_reference,
+        verified_at,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+      ON CONFLICT (customer_id)
+      DO UPDATE SET
+        verification_type = EXCLUDED.verification_type,
+        verification_number = EXCLUDED.verification_number,
+        verification_dob = EXCLUDED.verification_dob,
+        status = EXCLUDED.status,
+        provider_reference = EXCLUDED.provider_reference,
+        verified_at = NOW()`,
+      [
+        customerId,
+        verificationType,
+        verificationNumber,
+        dob,
+        "VERIFIED",
+        providerData?.reference ||
+          providerData?.provider_reference ||
+          providerData?.data?.reference ||
+          providerData?.data?.provider_reference ||
+          null,
+      ]
     );
-
-    if (existingOnboarding.rows.length > 0) {
-      await pool.query(
-        `UPDATE onboarding
-         SET verification_type = $1,
-             verification_number = $2,
-             verification_dob = $3,
-             status = $4,
-             provider_reference = $5,
-             verified_at = $6
-         WHERE customer_id = $7`,
-        [
-          verificationType,
-          verificationNumber,
-          verificationDob,
-          "VERIFIED",
-          providerReference,
-          new Date(),
-          customerId,
-        ]
-      );
-    } else {
-      await pool.query(
-        `INSERT INTO onboarding
-         (
-           customer_id,
-           verification_type,
-           verification_number,
-           verification_dob,
-           status,
-           provider_reference,
-           verified_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          customerId,
-          verificationType,
-          verificationNumber,
-          verificationDob,
-          "VERIFIED",
-          providerReference,
-          new Date(),
-        ]
-      );
-    }
 
     return res.status(200).json({
       message: "Customer verification successful",
-      data: response.data,
+      data: providerData,
     });
   } catch (error) {
     console.error(
-      "Verification error:",
+      "Customer verification error:",
       error.response?.data || error.message
     );
 
@@ -151,4 +184,3 @@ const verifyCustomer = async (req, res) => {
 module.exports = {
   verifyCustomer,
 };
-

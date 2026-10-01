@@ -28,6 +28,7 @@ const interbankTransfer = async (req, res) => {
   }
 
   const customerId = Number(customer_id);
+  const transferAmount = Number(amount);
 
   if (!Number.isInteger(customerId) || customerId <= 0) {
     return res.status(400).json({
@@ -35,17 +36,33 @@ const interbankTransfer = async (req, res) => {
     });
   }
 
-  const transferAmount = Number(amount);
-
-  if (!Number.isFinite(transferAmount) || transferAmount <= 0) {
+  if (
+    !Number.isFinite(transferAmount) ||
+    transferAmount <= 0
+  ) {
     return res.status(400).json({
       message: "Transfer amount must be greater than zero",
     });
   }
 
-  if (sender_account_number === receiver_account_number) {
+  if (
+    sender_account_number ===
+    receiver_account_number
+  ) {
     return res.status(400).json({
-      message: "Sender and receiver accounts must be different",
+      message:
+        "Sender and receiver accounts must be different",
+    });
+  }
+
+  if (
+    !/^\d{10}$/.test(
+      receiver_account_number.toString()
+    )
+  ) {
+    return res.status(400).json({
+      message:
+        "Receiver account number must be 10 digits",
     });
   }
 
@@ -72,15 +89,10 @@ const interbankTransfer = async (req, res) => {
 
     const sender = senderResult.rows[0];
 
-    if (sender.customer_id !== customerId) {
+    if (Number(sender.customer_id) !== customerId) {
       return res.status(403).json({
-        message: "You are not authorized to use this account",
-      });
-    }
-
-    if (!sender.nibss_account_number) {
-      return res.status(400).json({
-        message: "Sender account is not linked to a NIBSS account",
+        message:
+          "You are not authorized to use this account",
       });
     }
 
@@ -92,11 +104,106 @@ const interbankTransfer = async (req, res) => {
       });
     }
 
-    const transactionReference = crypto.randomUUID();
+    /*
+     * PAYASAP DEMO ACCOUNT
+     *
+     * This account does not exist inside NIBSS.
+     * Therefore we simulate the inter-bank transfer
+     * locally instead of sending it to NIBSS.
+     */
+    const onboardingResult = await client.query(
+      `SELECT provider_reference
+       FROM onboarding
+       WHERE customer_id = $1
+         AND status = 'VERIFIED'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [customerId]
+    );
+
+    const providerReference =
+      onboardingResult.rows[0]?.provider_reference;
+
+    if (providerReference === "PAYASAP-DEMO") {
+      const transactionReference =
+        crypto.randomUUID();
+
+      await client.query("BEGIN");
+
+      await client.query(
+        `UPDATE accounts
+         SET balance = balance - $1
+         WHERE id = $2`,
+        [transferAmount, sender.id]
+      );
+
+      const transactionResult = await client.query(
+        `INSERT INTO transactions (
+           transaction_reference,
+           sender_account_id,
+           receiver_account_id,
+           receiver_account_number,
+           receiver_bank_code,
+           amount,
+           transfer_type,
+           status,
+           narration,
+           provider_reference
+         )
+         VALUES (
+           $1,
+           $2,
+           NULL,
+           $3,
+           $4,
+           $5,
+           'INTER_BANK',
+           'SUCCESS',
+           $6,
+           'PAYASAP-DEMO'
+         )
+         RETURNING *`,
+        [
+          transactionReference,
+          sender.id,
+          receiver_account_number,
+          receiver_bank_code,
+          transferAmount,
+          narration || "Demo inter-bank transfer",
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        message:
+          "Demo inter-bank transfer successful",
+        demo: true,
+        transaction:
+          transactionResult.rows[0],
+      });
+    }
+
+    /*
+     * REAL NIBSS INTER-BANK TRANSFER
+     *
+     * This path is kept for accounts that were
+     * actually created through NIBSS.
+     */
+    if (!sender.nibss_account_number) {
+      return res.status(400).json({
+        message:
+          "Sender account is not linked to a NIBSS account",
+      });
+    }
+
+    const transactionReference =
+      crypto.randomUUID();
 
     const nibssResult = await transferFunds(
       sender.nibss_account_number,
       receiver_account_number,
+      receiver_bank_code,
       transferAmount
     );
 
@@ -111,30 +218,30 @@ const interbankTransfer = async (req, res) => {
 
     const transactionResult = await client.query(
       `INSERT INTO transactions (
-        transaction_reference,
-        sender_account_id,
-        receiver_account_id,
-        receiver_account_number,
-        receiver_bank_code,
-        amount,
-        transfer_type,
-        status,
-        narration,
-        provider_reference
-      )
-      VALUES (
-        $1,
-        $2,
-        NULL,
-        $3,
-        $4,
-        $5,
-        'INTER_BANK',
-        'SUCCESS',
-        $6,
-        $7
-      )
-      RETURNING *`,
+         transaction_reference,
+         sender_account_id,
+         receiver_account_id,
+         receiver_account_number,
+         receiver_bank_code,
+         amount,
+         transfer_type,
+         status,
+         narration,
+         provider_reference
+       )
+       VALUES (
+         $1,
+         $2,
+         NULL,
+         $3,
+         $4,
+         $5,
+         'INTER_BANK',
+         'SUCCESS',
+         $6,
+         $7
+       )
+       RETURNING *`,
       [
         transactionReference,
         sender.id,
@@ -151,15 +258,21 @@ const interbankTransfer = async (req, res) => {
     await client.query("COMMIT");
 
     return res.status(201).json({
-      message: "Inter-bank transfer successful",
-      transaction: transactionResult.rows[0],
+      message:
+        "Inter-bank transfer successful",
+      demo: false,
+      transaction:
+        transactionResult.rows[0],
       provider_response: nibssResult,
     });
   } catch (error) {
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Rollback error:", rollbackError.message);
+      console.error(
+        "Rollback error:",
+        rollbackError.message
+      );
     }
 
     console.error(
@@ -167,9 +280,12 @@ const interbankTransfer = async (req, res) => {
       error.response?.data || error.message
     );
 
-    return res.status(error.response?.status || 500).json({
+    return res.status(
+      error.response?.status || 500
+    ).json({
       message: "Inter-bank transfer failed",
-      error: error.response?.data || error.message,
+      error:
+        error.response?.data || error.message,
     });
   } finally {
     client.release();
